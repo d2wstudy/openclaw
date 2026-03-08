@@ -1,0 +1,176 @@
+name: Docker Dev
+
+on:
+  push:
+    branches:
+      - dev
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "**/*.mdx"
+      - ".agents/**"
+      - "skills/**"
+  workflow_dispatch: {}
+
+concurrency:
+  group: docker-dev-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    # Optional VPS deploy (after publishing image):
+    # - OPENCLAW_DEPLOY_HOST: VPS hostname/IP
+    # - OPENCLAW_DEPLOY_USER: SSH username
+    # - OPENCLAW_DEPLOY_PORT: SSH port (optional, default 22)
+    # - OPENCLAW_DEPLOY_DIR: directory on the VPS containing docker-compose.yml
+    # - OPENCLAW_DEPLOY_SSH_KEY: SSH private key (for the deploy user)
+    # - OPENCLAW_DEPLOY_KNOWN_HOSTS: known_hosts entry for the VPS (recommended)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: tags
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          {
+            echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+            echo "tag_dev=${IMAGE}:dev" >> "$GITHUB_OUTPUT"
+            echo "tag_sha=${IMAGE}:dev-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          }
+
+      - name: Build and push multi-arch image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.tags.outputs.tag_dev }}
+            ${{ steps.tags.outputs.tag_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Setup SSH agent
+        if: ${{ success() && secrets.OPENCLAW_DEPLOY_HOST != '' && secrets.OPENCLAW_DEPLOY_SSH_KEY != '' }}
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.OPENCLAW_DEPLOY_SSH_KEY }}
+
+      - name: Add deploy host to known_hosts
+        if: ${{ success() && secrets.OPENCLAW_DEPLOY_HOST != '' && secrets.OPENCLAW_DEPLOY_SSH_KEY != '' && secrets.OPENCLAW_DEPLOY_KNOWN_HOSTS != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.OPENCLAW_DEPLOY_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy to VPS (docker compose pull/up)
+        if: ${{ success() && secrets.OPENCLAW_DEPLOY_HOST != '' && secrets.OPENCLAW_DEPLOY_SSH_KEY != '' }}
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.OPENCLAW_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.OPENCLAW_DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.OPENCLAW_DEPLOY_PORT }}
+          DEPLOY_DIR: ${{ secrets.OPENCLAW_DEPLOY_DIR }}
+          IMAGE_TAG_SHA: ${{ steps.tags.outputs.tag_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${DEPLOY_USER:-}" ]]; then
+            echo "Missing secret: OPENCLAW_DEPLOY_USER" >&2
+            exit 2
+          fi
+          if [[ -z "${DEPLOY_DIR:-}" ]]; then
+            echo "Missing secret: OPENCLAW_DEPLOY_DIR" >&2
+            exit 2
+          fi
+
+          port="${DEPLOY_PORT:-22}"
+          echo "Deploying ${IMAGE_TAG_SHA} to ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DIR}"
+
+          ssh -p "$port" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "OPENCLAW_IMAGE='${IMAGE_TAG_SHA}' DEPLOY_DIR='${DEPLOY_DIR}' bash -s" <<'EOF'
+          set -euo pipefail
+
+          if [[ -z "${DEPLOY_DIR:-}" ]]; then
+            echo "DEPLOY_DIR is required" >&2
+            exit 2
+          fi
+          if [[ -z "${OPENCLAW_IMAGE:-}" ]]; then
+            echo "OPENCLAW_IMAGE is required" >&2
+            exit 2
+          fi
+
+          cd "${DEPLOY_DIR}"
+
+          COMPOSE_ARGS=(-f docker-compose.yml)
+          if [[ -f docker-compose.extra.yml ]]; then
+            COMPOSE_ARGS+=(-f docker-compose.extra.yml)
+          fi
+          if [[ -f docker-compose.sandbox.yml ]]; then
+            COMPOSE_ARGS+=(-f docker-compose.sandbox.yml)
+          fi
+
+          export OPENCLAW_IMAGE
+          docker compose "${COMPOSE_ARGS[@]}" pull openclaw-gateway
+          docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate openclaw-gateway
+          docker compose "${COMPOSE_ARGS[@]}" ps --status running || true
+EOF
+
+      - name: Job summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ✅ Dev image published
+
+          - \`${{ steps.tags.outputs.tag_dev }}\`
+          - \`${{ steps.tags.outputs.tag_sha }}\`
+
+          Deploy (first time):
+          \`\`\`bash
+          docker login ghcr.io
+          export OPENCLAW_IMAGE="${{ steps.tags.outputs.tag_dev }}"
+          ./docker-setup.sh
+          \`\`\`
+
+          Deploy (update existing):
+          \`\`\`bash
+          docker login ghcr.io
+          export OPENCLAW_IMAGE="${{ steps.tags.outputs.tag_dev }}"
+          docker compose pull
+          docker compose up -d openclaw-gateway
+          \`\`\`
+          EOF
