@@ -147,7 +147,7 @@ jobs:
           docker compose "${COMPOSE_ARGS[@]}" pull openclaw-gateway
           docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate openclaw-gateway
           docker compose "${COMPOSE_ARGS[@]}" ps --status running || true
-EOF
+          EOF
 
       - name: Job summary
         if: ${{ success() }}
