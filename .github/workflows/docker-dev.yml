@@ -80,14 +80,39 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Determine deploy eligibility
+        id: deploy_gate
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.OPENCLAW_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.OPENCLAW_DEPLOY_USER }}
+          DEPLOY_DIR: ${{ secrets.OPENCLAW_DEPLOY_DIR }}
+          DEPLOY_SSH_KEY: ${{ secrets.OPENCLAW_DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.OPENCLAW_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          enabled=true
+          if [[ -z "${DEPLOY_HOST:-}" || -z "${DEPLOY_USER:-}" || -z "${DEPLOY_DIR:-}" || -z "${DEPLOY_SSH_KEY:-}" ]]; then
+            enabled=false
+          fi
+
+          if [[ -n "${DEPLOY_KNOWN_HOSTS:-}" ]]; then
+            echo "known_hosts=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "known_hosts=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
       - name: Setup SSH agent
-        if: ${{ success() && secrets.OPENCLAW_DEPLOY_HOST != '' && secrets.OPENCLAW_DEPLOY_SSH_KEY != '' }}
+        if: ${{ success() && steps.deploy_gate.outputs.enabled == 'true' }}
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.OPENCLAW_DEPLOY_SSH_KEY }}
 
       - name: Add deploy host to known_hosts
-        if: ${{ success() && secrets.OPENCLAW_DEPLOY_HOST != '' && secrets.OPENCLAW_DEPLOY_SSH_KEY != '' && secrets.OPENCLAW_DEPLOY_KNOWN_HOSTS != '' }}
+        if: ${{ success() && steps.deploy_gate.outputs.known_hosts == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -97,7 +122,7 @@ jobs:
           chmod 600 ~/.ssh/known_hosts
 
       - name: Deploy to VPS (docker compose pull/up)
-        if: ${{ success() && secrets.OPENCLAW_DEPLOY_HOST != '' && secrets.OPENCLAW_DEPLOY_SSH_KEY != '' }}
+        if: ${{ success() && steps.deploy_gate.outputs.enabled == 'true' }}
         shell: bash
         env:
           DEPLOY_HOST: ${{ secrets.OPENCLAW_DEPLOY_HOST }}
